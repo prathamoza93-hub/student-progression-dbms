@@ -1,6 +1,7 @@
 streamlit
 pandas
 plotly
-psycopg2-binary
 gspread
 google-auth
+psycopg2-binary
+sqlalchemy
