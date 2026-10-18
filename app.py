@@ -3,16 +3,34 @@ import pandas as pd
 import plotly.graph_objects as go
 import gspread
 from google.oauth2.service_account import Credentials
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from sqlalchemy import create_engine, text
 import json
 
 st.set_page_config(page_title="Student Progression & Portfolio DB", layout="wide")
 
-# --- DATABASE CONNECTION ---
-def get_db_connection():
-    return psycopg2.connect(st.secrets["postgres"]["url"])
-    
+# --- BULLETPROOF DATABASE CONNECTION ENGINE ---
+@st.cache_resource
+def get_db_engine():
+    raw_url = st.secrets["postgres"]["url"]
+    # Ensure standard postgresql URI prefix for SQLAlchemy
+    if raw_url.startswith("postgres://"):
+        raw_url = raw_url.replace("postgres://", "postgresql://", 1)
+    return create_engine(
+        raw_url,
+        pool_pre_ping=True,      # Tests connection before using (handles Neon wake-ups)
+        pool_recycle=300         # Recycles connections every 5 mins
+    )
+
+def run_query(query_str, params=None):
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        return pd.read_sql(text(query_str), conn, params=params)
+
+def execute_dml(dml_str, params=None):
+    engine = get_db_engine()
+    with engine.begin() as conn:
+        conn.execute(text(dml_str), params or {})
+
 # --- GOOGLE SHEETS SYNC LAYER ---
 def sync_to_google_sheet(student_id, student_name, sgpa, cgpa, sem):
     try:
@@ -40,33 +58,38 @@ with search_col:
     search_query = st.text_input("🔍 Search Student by Full Name:")
 
 if search_query:
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    cur.execute("SELECT * FROM students WHERE full_name ILIKE %s;", (f"%{search_query}%",))
-    students = cur.fetchall()
-    
-    if not students:
+    try:
+        students_df = run_query(
+            "SELECT * FROM students WHERE full_name ILIKE :q",
+            {"q": f"%{search_query}%"}
+        )
+    except Exception as err:
+        st.error(f"Database Connection Error: {err}")
+        st.stop()
+
+    if students_df.empty:
         st.warning("No students found matching that name.")
     else:
-        student = students[0]
+        student = students_df.iloc[0]
         st.success(f"Loaded Profile: **{student['full_name']}** (ID: `{student['student_id']}`)")
         
+        # Profile Summary Metrics
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Secondary (10th)", f"{student['secondary_percentage']}%")
         m2.metric("Higher Sec (12th)", f"{student['higher_secondary_percentage']}%")
-        m3.metric("Admission Year", student['admission_year'])
+        m3.metric("Admission Year", int(student['admission_year']))
         m4.metric("Contact Email", student['email'])
 
         # Fetch Academic Progression
-        cur.execute("""
+        df_prog = run_query(
+            """
             SELECT semester_num, academic_year, sgpa, cgpa, is_drop_year, drop_reason
             FROM semester_progress
-            WHERE student_id = %s
-            ORDER BY semester_num ASC;
-        """, (student['student_id'],))
-        prog_records = cur.fetchall()
-        df_prog = pd.DataFrame(prog_records)
+            WHERE student_id = :sid
+            ORDER BY semester_num ASC
+            """,
+            {"sid": student['student_id']}
+        )
 
         st.subheader("📈 Academic Progression & Gap Year Analysis")
         
@@ -117,47 +140,52 @@ if search_query:
         ])
 
         with tab_courses:
-            cur.execute("""
+            marks_df = run_query(
+                """
                 SELECT sp.semester_num, c.course_code, c.course_name, c.course_type, 
                        sm.internal_marks, sm.external_marks, sm.total_marks, sm.grade_point
                 FROM semester_marks sm
                 JOIN semester_progress sp ON sm.progress_id = sp.progress_id
                 JOIN courses c ON sm.course_code = c.course_code
-                WHERE sp.student_id = %s
-                ORDER BY sp.semester_num, c.course_type DESC;
-            """, (student['student_id'],))
-            marks_data = cur.fetchall()
-            st.dataframe(pd.DataFrame(marks_data), use_container_width=True)
+                WHERE sp.student_id = :sid
+                ORDER BY sp.semester_num, c.course_type DESC
+                """,
+                {"sid": student['student_id']}
+            )
+            st.dataframe(marks_df, use_container_width=True)
 
         with tab_seminars:
-            cur.execute("""
+            sem_df = run_query(
+                """
                 SELECT p.title, p.organization_issuer, p.event_date, pc.sub_type AS scope, p.status
                 FROM student_portfolios p
                 JOIN portfolio_categories pc ON p.category_id = pc.category_id
-                WHERE p.student_id = %s AND pc.main_type = 'Seminar';
-            """, (student['student_id'],))
-            sem_data = cur.fetchall()
-            df_sem = pd.DataFrame(sem_data)
-            if not df_sem.empty:
+                WHERE p.student_id = :sid AND pc.main_type = 'Seminar'
+                """,
+                {"sid": student['student_id']}
+            )
+            if not sem_df.empty:
                 col_i, col_e = st.columns(2)
                 with col_i:
                     st.write("**Internal Seminars**")
-                    st.dataframe(df_sem[df_sem['scope'] == 'Internal'], use_container_width=True)
+                    st.dataframe(sem_df[sem_df['scope'] == 'Internal'], use_container_width=True)
                 with col_e:
                     st.write("**External Seminars**")
-                    st.dataframe(df_sem[df_sem['scope'] == 'External'], use_container_width=True)
+                    st.dataframe(sem_df[sem_df['scope'] == 'External'], use_container_width=True)
             else:
                 st.info("No seminar records found.")
 
         with tab_activities:
-            cur.execute("""
+            act_df = run_query(
+                """
                 SELECT p.title, p.organization_issuer, p.event_date, pc.sub_type, p.status
                 FROM student_portfolios p
                 JOIN portfolio_categories pc ON p.category_id = pc.category_id
-                WHERE p.student_id = %s AND pc.main_type = 'Activity';
-            """, (student['student_id'],))
-            act_data = cur.fetchall()
-            st.dataframe(pd.DataFrame(act_data), use_container_width=True)
+                WHERE p.student_id = :sid AND pc.main_type = 'Activity'
+                """,
+                {"sid": student['student_id']}
+            )
+            st.dataframe(act_df, use_container_width=True)
 
         # --- CRUD & GOOGLE SHEETS SYNC SECTION ---
         st.markdown("---")
@@ -173,14 +201,24 @@ if search_query:
             submit_btn = st.form_submit_button("Commit to DB & Push to Google Sheets")
             if submit_btn:
                 try:
-                    cur.execute("""
+                    execute_dml(
+                        """
                         INSERT INTO semester_progress 
                         (student_id, semester_num, academic_year, sgpa, cgpa, is_drop_year, drop_reason)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        VALUES (:sid, :sem, :ay, :sgpa, :cgpa, :drop, :reason)
                         ON CONFLICT (student_id, semester_num) 
-                        DO UPDATE SET sgpa = EXCLUDED.sgpa, cgpa = EXCLUDED.cgpa;
-                    """, (student['student_id'], f_sem, f_year, f_sgpa, f_cgpa, f_drop, f_reason))
-                    conn.commit()
+                        DO UPDATE SET sgpa = EXCLUDED.sgpa, cgpa = EXCLUDED.cgpa
+                        """,
+                        {
+                            "sid": student['student_id'],
+                            "sem": int(f_sem),
+                            "ay": f_year,
+                            "sgpa": float(f_sgpa),
+                            "cgpa": float(f_cgpa),
+                            "drop": f_drop,
+                            "reason": f_reason
+                        }
+                    )
                     
                     sync_success = sync_to_google_sheet(
                         student['student_id'], student['full_name'], f_sgpa, f_cgpa, f_sem
@@ -189,8 +227,4 @@ if search_query:
                         st.success("Successfully written to Database and synchronized with Google Sheets!")
                         st.rerun()
                 except Exception as ex:
-                    conn.rollback()
                     st.error(f"Database Error: {ex}")
-
-    cur.close()
-    conn.close()
