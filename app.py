@@ -11,14 +11,16 @@ st.set_page_config(page_title="Student Progression & Portfolio DB", layout="wide
 # --- BULLETPROOF DATABASE CONNECTION ENGINE ---
 @st.cache_resource
 def get_db_engine():
-    raw_url = st.secrets["postgres"]["url"]
-    # Ensure standard postgresql URI prefix for SQLAlchemy
-    if raw_url.startswith("postgres://"):
-        raw_url = raw_url.replace("postgres://", "postgresql://", 1)
-    return create_engine(
-        raw_url,
-        pool_pre_ping=True,      # Tests connection before using (handles Neon wake-ups)
-        pool_recycle=300         # Recycles connections every 5 mins
+    raw_url = st.secrets["postgres"]["url"].strip()
+    # Drop any driver suffix or old-style prefix, then force psycopg2
+    for prefix in ("postgresql+psycopg://", "postgresql+psycopg2://", "postgres://", "postgresql://"):
+        if raw_url.startswith(prefix):
+            raw_url = raw_url[len(prefix):]
+            break
+    raw_url = "postgresql+psycopg2://" + raw_url
+    # channel_binding can cause connection failures with psycopg2 on some setups
+    raw_url = raw_url.replace("&channel_binding=require", "").replace("channel_binding=require&", "")
+    return create_engine(raw_url, pool_pre_ping=True, pool_recycle=300
     )
 
 def run_query(query_str, params=None):
