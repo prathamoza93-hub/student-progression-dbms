@@ -10,15 +10,16 @@ import json
 st.set_page_config(page_title="Student Progression & Portfolio DB", layout="wide")
 
 # --- DATABASE CONNECTION ---
+# --- DATABASE CONNECTION ---
 def get_db_connection():
     return psycopg2.connect(
         dbname=st.secrets["postgres"]["dbname"],
         user=st.secrets["postgres"]["user"],
         password=st.secrets["postgres"]["password"],
         host=st.secrets["postgres"]["host"],
-        port=st.secrets["postgres"]["port"]
+        port=st.secrets["postgres"]["port"],
+        sslmode="require"
     )
-
 # --- GOOGLE SHEETS SYNC LAYER ---
 def sync_to_google_sheet(student_id, student_name, sgpa, cgpa, sem):
     try:
